@@ -1,30 +1,65 @@
-# Core dependencies
+# Core Modal dependency
 modal==0.73.116
+
+# Core ML dependencies
 openai==1.68.2
 anthropic==0.49.0
 groq==0.20.0
 instructor==0.5.0
 pydantic==2.10.6
-typer==0.9.4
-rich==13.9.4
+pydantic_core==2.27.2
 
 # Data processing
-polars==1.25.2
+polars==1.26.0
+pandas==2.2.3
 python-dotenv==1.0.1
 aiofiles==24.1.0
 jsonschema==4.23.0
+jsonschema-specifications==2024.10.1
+rpds-py==0.23.1
+referencing==0.36.2
+
+# Code analysis and tokenization
+libcst==1.7.0
 tiktoken==0.9.0
 
 # HTTP and async
 httpx==0.28.1
+httpcore==1.0.7
 anyio==4.9.0
 aiohttp==3.11.14
+requests==2.32.3
+aiohappyeyeballs==2.6.1
+aiosignal==1.3.1
+aiostream==0.6.4
+sniffio==1.3.1
+
+# CLI and formatting
+typer==0.9.4
+rich==13.9.4
+click==8.1.8
+markdown-it-py==3.0.0
+mdurl==0.1.2
+pygments==2.19.1
 
 # Development utilities
 tqdm==4.67.1
-libcst==1.7.0
-
-# Modal related
 cloudpickle==2.2.1
 tblib==3.0.0
-synchronicity==0.9.11 
+synchronicity==0.9.11
+multiprocess==0.70.16
+multidict==6.2.0
+dill==0.3.8
+toml==0.10.2
+
+# Modal-specific dependencies
+certifi==2025.1.31
+jiter==0.9.0
+h2==4.2.0
+h11==0.14.0
+hpack==4.1.0
+hyperframe==6.1.0
+grpclib==0.4.7
+sigtools==4.0.1
+protobuf==4.25.6
+propcache==0.3.0 
