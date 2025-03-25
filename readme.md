@@ -32,6 +32,7 @@ Before getting started, make sure you have:
 - Python 3.8 or higher not 3.12, we are using 3.11 on modal and is ok
 - Modal CLI installed
 - API keys for LLM providers (Groq recommended for these tests OBV we need to change, VLLM missing imports etc)
+- Currently we are using groq for testing, what actually needs to happen when everything is working is to load the model direct on modal and run everything remote
 
 ```bash
 # Install required packages
