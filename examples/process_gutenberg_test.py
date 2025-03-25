@@ -46,16 +46,18 @@ app = modal.App("gutenberg-processor")
     },
     image=image,
     memory=2048,
-    timeout=600
+    timeout=1200  # Increased timeout to 20 minutes
 )
-def process_book(book_index: int = 0, provider: str = "groq", max_text_length: int = 2000):
+def process_book(book_index: int = 0, provider: str = "groq", max_chunk_size: int = 4000, chunk_overlap: int = 200, concurrency: int = 5):
     """
     Process a single book from the Gutenberg dataset using the lit_agents app.
     
     Args:
         book_index: Index of the book to process from the list of available books
         provider: LLM provider to use (e.g., "groq", "anthropic", "openai")
-        max_text_length: Maximum length of text to process
+        max_chunk_size: Maximum size of each text chunk to process in parallel
+        chunk_overlap: Overlap between consecutive chunks to maintain context
+        concurrency: Maximum number of chunks to process in parallel
     """
     # Convert book_index to int in case it's passed as a string
     book_index = int(book_index)
@@ -92,17 +94,12 @@ def process_book(book_index: int = 0, provider: str = "groq", max_text_length: i
     
     print(f"Original text length: {len(text)} characters")
     
-    # Trim text if needed
-    if len(text) > max_text_length:
-        text = text[:max_text_length]
-        print(f"Text trimmed to {max_text_length} characters")
-    
     # Extract book metadata
     metadata = {
         "title": f"Gutenberg Book {book_data.get('identifier', 'Unknown')}",
-        "author": "Unknown",
+        "author": book_data.get("author", "Unknown"),
         "book_id": book_data.get("identifier", "Unknown"),
-        "language": "Unknown",
+        "language": book_data.get("language", "Unknown"),
         "word_count": book_data.get("word_count", 0),
         "source_file": selected_file
     }
@@ -117,19 +114,22 @@ def process_book(book_index: int = 0, provider: str = "groq", max_text_length: i
         
         print(f"Using provider: {provider}")
         
-        # Use our own simplified process_story function
-        print("Calling simple_process_story.remote()...")
-        actions = simple_process_story.remote(text, provider=provider)
-        print(f"Received result from simple_process_story with {len(actions)} actions")
+        # Process the entire book in parallel chunks
+        print(f"Splitting book into chunks (max size: {max_chunk_size}, overlap: {chunk_overlap})...")
+        actions = process_text_in_parallel.remote(text, provider, max_chunk_size, chunk_overlap, concurrency)
+        print(f"Received result with {len(actions)} actions")
         
         # Add metadata and processing info
         result_data = {
-            "actions": actions,  # The actions list from the remote call
+            "actions": actions,  # The actions list from the parallel processing
             "book_metadata": metadata,
             "processing_info": {
                 "provider": provider,
                 "timestamp": datetime.now().isoformat(),
-                "max_text_length": max_text_length
+                "max_chunk_size": max_chunk_size,
+                "chunk_overlap": chunk_overlap,
+                "concurrency": concurrency,
+                "total_chunks": max(1, (len(text) // (max_chunk_size - chunk_overlap)) + 1)
             }
         }
         
@@ -162,7 +162,8 @@ def process_book(book_index: int = 0, provider: str = "groq", max_text_length: i
             "processing_info": {
                 "provider": provider,
                 "timestamp": datetime.now().isoformat(),
-                "max_text_length": max_text_length
+                "max_chunk_size": max_chunk_size,
+                "chunk_overlap": chunk_overlap
             }
         }
         
@@ -175,6 +176,133 @@ def process_book(book_index: int = 0, provider: str = "groq", max_text_length: i
         
         print(f"Error saved to {error_path}")
         return error_result
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("my-openai-secret")],
+    memory=2048,
+    timeout=600
+)
+def process_text_in_parallel(text: str, provider: str = "groq", max_chunk_size: int = 4000, chunk_overlap: int = 200, concurrency: int = 5):
+    """
+    Process a long text by splitting it into overlapping chunks and processing them in parallel.
+    
+    Args:
+        text: The full text to process
+        provider: LLM provider to use ("openai", "anthropic", or "groq")
+        max_chunk_size: Maximum size of each text chunk
+        chunk_overlap: Overlap between consecutive chunks
+        concurrency: Maximum number of chunks to process in parallel
+        
+    Returns:
+        list: Combined list of actions from all chunks with duplicate removal
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time
+    from datetime import timedelta
+    
+    # Split the text into overlapping chunks
+    chunks = []
+    start_idx = 0
+    
+    while start_idx < len(text):
+        end_idx = min(start_idx + max_chunk_size, len(text))
+        
+        # Try to find sentence boundaries for cleaner splits
+        if end_idx < len(text) and end_idx - start_idx > 500:
+            # Look for sentence ending punctuation followed by space within the last 200 characters
+            for i in range(end_idx, max(end_idx - 200, start_idx), -1):
+                if i < len(text) and text[i-1] in ['.', '!', '?'] and (i == len(text) or text[i].isspace()):
+                    end_idx = i
+                    break
+        
+        # If we're at the end of the text, just use what's left
+        if end_idx >= len(text):
+            chunks.append(text[start_idx:])
+            break
+            
+        chunks.append(text[start_idx:end_idx])
+        # Move to the next chunk with overlap
+        start_idx = end_idx - chunk_overlap
+    
+    print(f"Split text into {len(chunks)} chunks (avg size: {sum(len(c) for c in chunks)/len(chunks):.0f} chars)")
+    
+    # Process chunks in parallel with a thread pool
+    all_actions = []
+    
+    # Function to process a single chunk
+    def process_chunk(idx, chunk_text):
+        print(f"Processing chunk {idx+1}/{len(chunks)} (length: {len(chunk_text)} chars)")
+        start_time = time.time()
+        
+        # Add a chunk identifier for traceability and to help with ordering
+        chunk_prefix = f"Chunk {idx+1} of {len(chunks)}: "
+        augmented_text = chunk_prefix + chunk_text
+        
+        # Process the chunk and get actions
+        try:
+            chunk_actions = simple_process_story.remote(augmented_text, provider=provider)
+            elapsed = time.time() - start_time
+            
+            # Add chunk metadata to each action
+            for action in chunk_actions:
+                action["chunk_idx"] = idx
+                action["chunk_start_char"] = start_idx + (idx * (max_chunk_size - chunk_overlap))
+                
+                # Adjust temporal_order_id to account for position in the book
+                # This ensures actions from later chunks have higher IDs
+                if "temporal_order_id" in action:
+                    action["original_temporal_order_id"] = action["temporal_order_id"]
+                    action["temporal_order_id"] = action["temporal_order_id"] + (idx * 1000)
+            
+            print(f"✅ Chunk {idx+1}: Extracted {len(chunk_actions)} actions in {elapsed:.2f}s")
+            return chunk_actions
+        except Exception as e:
+            print(f"❌ Error processing chunk {idx+1}: {str(e)}")
+            return []
+    
+    # Process chunks in parallel with ThreadPoolExecutor
+    print(f"Processing chunks in parallel with concurrency={concurrency}...")
+    start_time = time.time()
+    
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        future_to_idx = {executor.submit(process_chunk, i, chunk): i for i, chunk in enumerate(chunks)}
+        
+        for future in as_completed(future_to_idx):
+            chunk_idx = future_to_idx[future]
+            try:
+                chunk_actions = future.result()
+                all_actions.extend(chunk_actions)
+                print(f"Chunk {chunk_idx+1} complete. Total actions so far: {len(all_actions)}")
+            except Exception as e:
+                print(f"Error getting result from chunk {chunk_idx+1}: {str(e)}")
+    
+    elapsed = time.time() - start_time
+    print(f"All chunks processed in {timedelta(seconds=int(elapsed))}. Total actions: {len(all_actions)}")
+    
+    # Sort actions by temporal_order_id to maintain narrative order
+    all_actions.sort(key=lambda x: x.get('temporal_order_id', 0))
+    
+    # Remove potential duplicates (similar actions from overlapping chunks)
+    deduplicated_actions = []
+    seen_actions = set()
+    
+    for action in all_actions:
+        # Create a simple signature for the action to identify duplicates
+        action_sig = f"{action.get('source', '')}_{action.get('action', '')}_{action.get('consequence', '')}"
+        
+        # If we haven't seen this action before, add it
+        if action_sig not in seen_actions:
+            deduplicated_actions.append(action)
+            seen_actions.add(action_sig)
+    
+    print(f"After deduplication: {len(deduplicated_actions)} unique actions")
+    
+    # Re-number the temporal_order_id to be sequential
+    for i, action in enumerate(deduplicated_actions, 1):
+        action["temporal_order_id"] = i
+    
+    return deduplicated_actions
 
 @app.function(
     volumes={"/results": results_vol},
@@ -784,16 +912,18 @@ def simple_process_story(story_text: str, provider: str = "groq"):
         "/results": results_vol,
     },
     image=image,
-    memory=2048,
+    memory=4096,  # Increased memory for batch processing
     timeout=3600  # 60 minutes timeout for batch processing
 )
 def batch_process_books(
     start_index: int = 0, 
-    count: int = 20,  # Increased default batch size
+    count: int = 20,
     provider: str = "groq", 
-    max_text_length: int = 2000,
+    max_chunk_size: int = 4000,
+    chunk_overlap: int = 200,
     skip_existing: bool = True,
-    concurrency: int = 3  # Number of books to process in parallel
+    book_concurrency: int = 3,  # Number of books to process in parallel
+    chunk_concurrency: int = 5  # Number of chunks per book to process in parallel
 ):
     """
     Process multiple books from the Gutenberg dataset in batch.
@@ -802,9 +932,11 @@ def batch_process_books(
         start_index: Index of the first book to process
         count: Number of books to process
         provider: LLM provider to use (e.g., "groq", "anthropic", "openai")
-        max_text_length: Maximum length of text to process
+        max_chunk_size: Maximum size of each text chunk
+        chunk_overlap: Overlap between consecutive chunks
         skip_existing: Whether to skip books that have already been processed
-        concurrency: Number of books to process in parallel
+        book_concurrency: Number of books to process in parallel
+        chunk_concurrency: Number of chunks per book to process in parallel
         
     Returns:
         dict: Summary of the batch processing
@@ -817,9 +949,11 @@ def batch_process_books(
     print(f"  - Start index: {start_index}")
     print(f"  - Count: {count}")
     print(f"  - Provider: {provider}")
-    print(f"  - Max text length: {max_text_length}")
+    print(f"  - Max chunk size: {max_chunk_size}")
+    print(f"  - Chunk overlap: {chunk_overlap}")
     print(f"  - Skip existing: {skip_existing}")
-    print(f"  - Concurrency: {concurrency}")
+    print(f"  - Book concurrency: {book_concurrency}")
+    print(f"  - Chunk concurrency: {chunk_concurrency}")
     
     # Ensure results directory exists
     results_dir = "/results/gutenberg_processed"
@@ -874,8 +1008,14 @@ def batch_process_books(
         start_time = time.time()
         
         try:
-            # Process the book using our existing function
-            result = process_book.remote(index, provider, max_text_length)
+            # Process the book using our updated function with parallel chunk processing
+            result = process_book.remote(
+                index, 
+                provider, 
+                max_chunk_size=max_chunk_size, 
+                chunk_overlap=chunk_overlap, 
+                concurrency=chunk_concurrency
+            )
             
             time_taken = time.time() - start_time
             
@@ -924,10 +1064,10 @@ def batch_process_books(
     
     batch_start_time = time.time()
     
-    print(f"\nStarting parallel processing with concurrency={concurrency}...")
+    print(f"\nStarting parallel processing with book_concurrency={book_concurrency}...")
     
     indices_to_process = list(range(start_index, end_index))
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+    with ThreadPoolExecutor(max_workers=book_concurrency) as executor:
         futures = {executor.submit(process_book_wrapper, i): i for i in indices_to_process}
         
         completed = 0
@@ -983,8 +1123,10 @@ def batch_process_books(
         "avg_actions_per_book": total_actions / max(1, successful),
         "total_time_seconds": batch_duration,
         "avg_time_per_book": batch_duration / max(1, successful + failed),
-        "concurrency": concurrency,
-        "max_text_length": max_text_length,
+        "book_concurrency": book_concurrency,
+        "chunk_concurrency": chunk_concurrency,
+        "max_chunk_size": max_chunk_size,
+        "chunk_overlap": chunk_overlap,
         "results": results
     }
     
@@ -1224,8 +1366,22 @@ if __name__ == "__main__":
             start_index = int(sys.argv[2]) if len(sys.argv) > 2 else 0
             count = int(sys.argv[3]) if len(sys.argv) > 3 else 5
             provider = sys.argv[4] if len(sys.argv) > 4 else "groq"
-            print(f"Running batch processing: start_index={start_index}, count={count}, provider={provider}")
-            modal.run(batch_process_books, start_index=start_index, count=count, provider=provider)
+            chunk_size = int(sys.argv[5]) if len(sys.argv) > 5 else 4000
+            book_concurrency = int(sys.argv[6]) if len(sys.argv) > 6 else 3
+            
+            print(f"Running batch processing with parallel chunks:")
+            print(f"  - Start index: {start_index}")
+            print(f"  - Count: {count}")
+            print(f"  - Provider: {provider}")
+            print(f"  - Chunk size: {chunk_size}")
+            print(f"  - Book concurrency: {book_concurrency}")
+            
+            modal.run(batch_process_books, 
+                      start_index=start_index, 
+                      count=count, 
+                      provider=provider, 
+                      max_chunk_size=chunk_size,
+                      book_concurrency=book_concurrency)
             
         elif command == "analyze":
             # Run analysis
@@ -1242,8 +1398,23 @@ if __name__ == "__main__":
             # Process a single book
             book_index = int(sys.argv[2]) if len(sys.argv) > 2 else 0
             provider = sys.argv[3] if len(sys.argv) > 3 else "groq"
-            print(f"Processing single book: index={book_index}, provider={provider}")
-            modal.run(process_book, book_index=book_index, provider=provider)
+            chunk_size = int(sys.argv[4]) if len(sys.argv) > 4 else 4000
+            chunk_overlap = int(sys.argv[5]) if len(sys.argv) > 5 else 200
+            concurrency = int(sys.argv[6]) if len(sys.argv) > 6 else 5
+            
+            print(f"Processing single book with parallel chunks:")
+            print(f"  - Book index: {book_index}")
+            print(f"  - Provider: {provider}")
+            print(f"  - Chunk size: {chunk_size}")
+            print(f"  - Chunk overlap: {chunk_overlap}")
+            print(f"  - Concurrency: {concurrency}")
+            
+            modal.run(process_book, 
+                      book_index=book_index, 
+                      provider=provider, 
+                      max_chunk_size=chunk_size, 
+                      chunk_overlap=chunk_overlap, 
+                      concurrency=concurrency)
             
         elif command == "view":
             # View sample actions for a specific book
@@ -1255,8 +1426,10 @@ if __name__ == "__main__":
         else:
             print(f"Unknown command: {command}")
             print("Available commands:")
-            print("  single <book_index> <provider> - Process a single book")
-            print("  batch <start_index> <count> <provider> - Process multiple books")
+            print("  single <book_index> <provider> <chunk_size> <chunk_overlap> <concurrency>")
+            print("    - Process a single book with parallel chunks")
+            print("  batch <start_index> <count> <provider> <chunk_size> <book_concurrency>")
+            print("    - Process multiple books in parallel")
             print("  list - List all processed results")
             print("  analyze <provider> - Analyze processed results")
             print("  view <book_index> <provider> - View sample actions for a book")
@@ -1264,14 +1437,16 @@ if __name__ == "__main__":
         # Default: list available commands
         print("Gutenberg Dataset Processor")
         print("Available commands:")
-        print("  single <book_index> <provider> - Process a single book")
-        print("  batch <start_index> <count> <provider> - Process multiple books")
+        print("  single <book_index> <provider> <chunk_size> <chunk_overlap> <concurrency>")
+        print("    - Process a single book with parallel chunks")
+        print("  batch <start_index> <count> <provider> <chunk_size> <book_concurrency>")
+        print("    - Process multiple books in parallel")
         print("  list - List all processed results")
         print("  analyze <provider> - Analyze processed results")
         print("  view <book_index> <provider> - View sample actions for a book")
         print("\nExamples:")
-        print("  python process_gutenberg_test.py single 5 groq")
-        print("  python process_gutenberg_test.py batch 0 10 groq")
+        print("  python process_gutenberg_test.py single 5 groq 4000 200 5")
+        print("  python process_gutenberg_test.py batch 0 10 groq 4000 3")
         print("  python process_gutenberg_test.py list")
         print("  python process_gutenberg_test.py analyze groq")
         print("  python process_gutenberg_test.py view 5 groq") 
